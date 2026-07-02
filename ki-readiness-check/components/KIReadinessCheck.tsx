@@ -1,6 +1,66 @@
 "use client";
 
-import { useState, useMemo } from "react";
+import { useState, useMemo, Component } from "react";
+import type { ReactNode, ErrorInfo } from "react";
+
+// ── Error Boundary ─────────────────────────────────────
+interface ErrorBoundaryProps {
+  children: ReactNode;
+}
+
+interface ErrorBoundaryState {
+  hasError: boolean;
+  error: Error | null;
+}
+
+class ErrorBoundary extends Component<ErrorBoundaryProps, ErrorBoundaryState> {
+  constructor(props: ErrorBoundaryProps) {
+    super(props);
+    this.state = { hasError: false, error: null };
+  }
+
+  static getDerivedStateFromError(error: Error): ErrorBoundaryState {
+    return { hasError: true, error };
+  }
+
+  componentDidCatch(error: Error, info: ErrorInfo): void {
+    console.error("KI-Readiness-Check error:", error, info.componentStack);
+  }
+
+  render() {
+    if (this.state.hasError) {
+      return (
+        <div style={{
+          minHeight: "100vh",
+          background: "linear-gradient(170deg, #0D1B2A 0%, #1A3A5C 50%, #2E6DA4 100%)",
+          display: "flex", alignItems: "center", justifyContent: "center", padding: 20,
+        }}>
+          <div style={{ maxWidth: 480, textAlign: "center" }}>
+            <h1 style={{ color: "#fff", fontSize: 24, fontWeight: 700, marginBottom: 12 }}>
+              Ein unerwarteter Fehler ist aufgetreten
+            </h1>
+            <p style={{ color: "#AED6F1", fontSize: 14, lineHeight: 1.6, marginBottom: 24 }}>
+              Bitte laden Sie die Seite neu, um den KI-Readiness-Check erneut zu starten.
+            </p>
+            <p style={{ color: "#E74C3C", fontSize: 12, marginBottom: 24, fontFamily: "monospace", opacity: 0.7 }}>
+              {this.state.error?.message}
+            </p>
+            <button
+              onClick={() => { this.setState({ hasError: false, error: null }); }}
+              style={{
+                background: "#E8720C", color: "#fff", border: "none", borderRadius: 8,
+                padding: "14px 40px", fontSize: 15, fontWeight: 700, cursor: "pointer",
+              }}
+            >
+              Neu starten
+            </button>
+          </div>
+        </div>
+      );
+    }
+    return this.props.children;
+  }
+}
 
 // ── Typen ──────────────────────────────────────────────
 type PersonaId = "solo" | "kmu" | "bereich";
@@ -553,7 +613,7 @@ function RadarChart({ dimScores }: { dimScores: Record<string, number> }) {
 }
 
 // ── Haupt-Komponente ───────────────────────────────────
-export default function KIReadinessCheck() {
+function KIReadinessCheckInner() {
   const [phase, setPhase] = useState<Phase>("intro");
   const [persona, setPersona] = useState<PersonaId | null>(null);
   const [currentDim, setCurrentDim] = useState(0);
@@ -567,11 +627,31 @@ export default function KIReadinessCheck() {
   const dim = DIMENSIONS[currentDim];
   const question = dim?.questions[currentQ];
 
-  const getQuestionText = (q: Question) => q.text[persona || "kmu"];
-  const getDimDescription = (d: Dimension) => d.description[persona || "kmu"];
+  const getQuestionText = (q: Question): string => {
+    if (!persona) {
+      console.warn("getQuestionText called without a selected persona, defaulting to 'kmu'");
+      return q.text["kmu"];
+    }
+    return q.text[persona];
+  };
+  const getDimDescription = (d: Dimension): string => {
+    if (!persona) {
+      console.warn("getDimDescription called without a selected persona, defaulting to 'kmu'");
+      return d.description["kmu"];
+    }
+    return d.description[persona];
+  };
 
   function selectAnswer(value: number) {
     if (animating) return;
+    if (!dim || !question) {
+      console.error("selectAnswer called with invalid state: dim or question is undefined");
+      return;
+    }
+    if (value < 1 || value > 4) {
+      console.error(`selectAnswer called with invalid value: ${value}`);
+      return;
+    }
     const newAnswers = { ...answers, [question.id]: value };
     setAnswers(newAnswers);
     setAnimating(true);
@@ -625,6 +705,7 @@ export default function KIReadinessCheck() {
               src="/logo.png"
               alt="ZweiMeter.Consulting"
               style={{ height: 56, display: "block" }}
+              onError={(e) => { (e.target as HTMLImageElement).style.display = "none"; }}
             />
           </div>
           <h1 style={{ color: "#fff", fontSize: 32, fontWeight: 700, lineHeight: 1.25, margin: "0 0 16px" }}>
@@ -705,6 +786,18 @@ export default function KIReadinessCheck() {
 
   // ── QUIZ ──
   if (phase === "quiz") {
+    if (!dim || !question) {
+      console.error(`Invalid quiz state: currentDim=${currentDim}, currentQ=${currentQ}`);
+      setCurrentDim(0);
+      setCurrentQ(0);
+      setPhase("persona");
+      return null;
+    }
+    if (!persona) {
+      console.error("Quiz phase reached without persona selection");
+      setPhase("persona");
+      return null;
+    }
     const globalQIndex = DIMENSIONS.slice(0, currentDim).reduce((s, d) => s + d.questions.length, 0) + currentQ;
     const isFirst = currentDim === 0 && currentQ === 0;
 
@@ -788,7 +881,17 @@ export default function KIReadinessCheck() {
   }
 
   // ── RESULT ──
+  if (!persona) {
+    console.error("Result phase reached without persona selection");
+    setPhase("persona");
+    return null;
+  }
   const personaInfo = PERSONAS.find((p) => p.id === persona);
+  if (!personaInfo) {
+    console.error(`Unknown persona: ${persona}`);
+    setPhase("persona");
+    return null;
+  }
   const isSolo = persona === "solo";
 
   return (
@@ -799,11 +902,12 @@ export default function KIReadinessCheck() {
             src="/logo.png"
             alt={assessment.ctaProduct}
             style={{ height: 28, display: "block" }}
+            onError={(e) => { (e.target as HTMLImageElement).style.display = "none"; }}
           />
         </div>
         <h1 style={{ color: "#fff", fontSize: 22, fontWeight: 700, marginTop: 4 }}>Ihr KI-Readiness-Ergebnis</h1>
         <div style={{ color: "#AED6F1", fontSize: 12, marginTop: 4 }}>
-          Perspektive: {personaInfo?.label}
+          Perspektive: {personaInfo.label}
         </div>
       </div>
 
@@ -941,5 +1045,13 @@ export default function KIReadinessCheck() {
         </div>
       </div>
     </div>
+  );
+}
+
+export default function KIReadinessCheck() {
+  return (
+    <ErrorBoundary>
+      <KIReadinessCheckInner />
+    </ErrorBoundary>
   );
 }
