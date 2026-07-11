@@ -10,7 +10,50 @@ Interaktives Web-Assessment-Tool zur Bestimmung der KI-Bereitschaft von Unterneh
 - **Killer-Dimensionen-Logik:** Strategie und Prozesse als K.O.-Kriterien
 - **Radar-Chart** (SVG) mit 6 Achsen
 - **Persona-abhängige Reports** mit differenzierten Handlungsempfehlungen
+- **E-Mail-Gate:** Pflicht-Lead-Erfassung vor dem Ergebnis (max. Lead-Quote)
+- **Brevo-Anbindung:** Leads landen inkl. Scores in einer Liste → Follow-up-Automation
+- **PDF-Export:** branded A4-Report per „Als PDF speichern" (Browser-Druck)
+- **Calendly-CTA:** persona-abhängige Terminbuchung, mit vorausgefüllten Daten
+- **Funnel-Tracking:** Plausible/GA4-Events über den gesamten Funnel
 - **Funnel-Steuerung:** Solo → zweimeter.online, KMU/Bereich → ZweiMeter.Consulting
+
+## Lead-Flow & Monetarisierung
+
+Der Check ist als **Leuchtturmprodukt** aufgebaut: kostenlos, hoher Wahrnehmungswert,
+und er füllt die Pipeline für die Beratung.
+
+```
+Intro → Persona → 24 Fragen → E-Mail-Gate (Lead → Brevo) → Report → CTA (Calendly)
+```
+
+- **Leads** werden serverseitig über `/api/lead` in **Brevo** angelegt (inkl. aller
+  Dimensions-Scores als Kontakt-Attribute). Die Ziel-Liste triggert deine Follow-up-Sequenz.
+- **Umsatz** entsteht über gebuchte **Calendly**-Termine (Erstgespräch → bezahlter Check).
+- **Später ins CRM:** Sobald `CRM_WEBHOOK_URL` gesetzt ist, wird jeder Lead zusätzlich
+  als JSON an das CRM (`D:\dev\crm-clean`) geschickt – am `Contact`-Modell ausgerichtet.
+
+### Konfiguration
+
+Alle Zugänge laufen über Umgebungsvariablen. Kopiere `.env.example` → `.env.local`
+und trage deine Werte ein (Details siehe Kommentare in der Datei):
+
+| Variable | Zweck |
+|----------|-------|
+| `BREVO_API_KEY` | Brevo v3 API-Key (Lead-Upsert) |
+| `BREVO_LIST_ID` | Ziel-Liste für Leads (triggert Follow-up) |
+| `BREVO_DOI_TEMPLATE_ID` / `BREVO_DOI_REDIRECT_URL` | optional: Double-Opt-In |
+| `NEXT_PUBLIC_CALENDLY_URL_SOLO` / `_BUSINESS` | Terminlinks je Persona |
+| `NEXT_PUBLIC_PRIVACY_URL` | Datenschutz-Link im Gate |
+| `NEXT_PUBLIC_PLAUSIBLE_DOMAIN` / `NEXT_PUBLIC_GA_ID` | optionales Tracking |
+| `CRM_WEBHOOK_URL` / `CRM_WEBHOOK_SECRET` | optional: CRM-Weiterleitung (später) |
+
+**Ohne Keys** läuft die App vollständig (Gate akzeptiert die Eingabe, Report erscheint) –
+der Lead wird nur nicht verschickt (Server-Log: `skipped_no_key`). Ideal für lokale Tests.
+
+**Brevo-Attribute** vorab anlegen (Kontakte → Einstellungen → Attribute): `VORNAME`,
+`NACHNAME`, `FIRMA` (Text), `KI_PERSONA`, `KI_LEVEL_TITEL`, `KI_KILLER`, `KI_QUELLE` (Text),
+sowie `KI_SCORE`, `KI_PROZENT`, `KI_LEVEL`, `KI_STRATEGIE`, `KI_PROZESSE`, `KI_DATEN`,
+`KI_TECHNIK`, `KI_MENSCHEN`, `KI_REGULATORIK` (Zahl).
 
 ## Tech Stack
 
@@ -97,11 +140,14 @@ Gesamtscore     = (D1×1.5 + D2×1.3 + D3×1.0 + D4×1.0 + D5×1.0 + D6×0.8) / 
 
 ## Nächste Schritte (nach Launch)
 
-- [ ] E-Mail-Gate vor Report (Lead-Erfassung)
-- [ ] PDF-Export des Ergebnisses
-- [ ] Calendly-Integration im CTA
-- [ ] Analytics/Tracking (Funnel-Events)
-- [ ] Brevo-Anbindung für Follow-up-Sequenzen
+- [x] E-Mail-Gate vor Report (Lead-Erfassung)
+- [x] PDF-Export des Ergebnisses
+- [x] Calendly-Integration im CTA
+- [x] Analytics/Tracking (Funnel-Events)
+- [x] Brevo-Anbindung für Follow-up-Sequenzen
+- [ ] CRM-Weiterleitung aktivieren (`CRM_WEBHOOK_URL` setzen, sobald CRM live)
+- [ ] Brevo-Follow-up-Automation gestalten (Willkommensmail + Nurture-Strecke)
+- [ ] A/B-Test Gate-Wording / Conversion-Optimierung
 
 ---
 

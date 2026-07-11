@@ -1,10 +1,97 @@
 "use client";
 
-import { useState, useMemo } from "react";
+import { useState, useMemo, useEffect } from "react";
+import { track } from "@/lib/analytics";
+import type { LeadPayload } from "@/lib/lead";
 
 // ── Typen ──────────────────────────────────────────────
 type PersonaId = "solo" | "kmu" | "bereich";
-type Phase = "intro" | "persona" | "quiz" | "result";
+type Phase = "intro" | "persona" | "quiz" | "gate" | "result";
+
+// ── Konfiguration (env, NEXT_PUBLIC_*) ─────────────────
+const CALENDLY_SOLO = process.env.NEXT_PUBLIC_CALENDLY_URL_SOLO || "";
+const CALENDLY_BUSINESS = process.env.NEXT_PUBLIC_CALENDLY_URL_BUSINESS || "";
+const PRIVACY_URL =
+  process.env.NEXT_PUBLIC_PRIVACY_URL || "https://zweimeter.consulting/datenschutz";
+
+const EMAIL_RX = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+
+// UTM-Parameter aus der URL lesen (Lead-Attribution)
+function readUtm(): Record<string, string> {
+  if (typeof window === "undefined") return {};
+  const p = new URLSearchParams(window.location.search);
+  const out: Record<string, string> = {};
+  ["utm_source", "utm_medium", "utm_campaign", "utm_content", "utm_term"].forEach((k) => {
+    const v = p.get(k);
+    if (v) out[k] = v;
+  });
+  return out;
+}
+
+// Calendly-Widget bei Bedarf nachladen (kein globales Script → schnellere Ladezeit)
+function loadCalendly(): Promise<void> {
+  return new Promise((resolve) => {
+    if (typeof window === "undefined") return resolve();
+    interface CalendlyWindow extends Window {
+      Calendly?: unknown;
+    }
+    const w = window as CalendlyWindow;
+    if (w.Calendly) return resolve();
+    if (!document.getElementById("calendly-css")) {
+      const link = document.createElement("link");
+      link.id = "calendly-css";
+      link.rel = "stylesheet";
+      link.href = "https://assets.calendly.com/assets/external/widget.css";
+      document.head.appendChild(link);
+    }
+    const existing = document.getElementById("calendly-js") as HTMLScriptElement | null;
+    if (existing) {
+      existing.addEventListener("load", () => resolve());
+      return;
+    }
+    const s = document.createElement("script");
+    s.id = "calendly-js";
+    s.src = "https://assets.calendly.com/assets/external/widget.js";
+    s.async = true;
+    s.onload = () => resolve();
+    s.onerror = () => resolve();
+    document.body.appendChild(s);
+  });
+}
+
+interface CalendlyPrefill {
+  name?: string;
+  email?: string;
+  summary?: string;
+}
+
+async function openCalendly(url: string, prefill: CalendlyPrefill) {
+  if (!url) {
+    if (typeof window !== "undefined") window.open("https://zweimeter.consulting", "_blank", "noopener");
+    return;
+  }
+  await loadCalendly();
+  const C = (window as unknown as {
+    Calendly?: {
+      initPopupWidget?: (opts: {
+        url: string;
+        prefill?: { name?: string; email?: string; customAnswers?: Record<string, string> };
+      }) => void;
+    };
+  }).Calendly;
+  if (C?.initPopupWidget) {
+    C.initPopupWidget({
+      url,
+      prefill: {
+        name: prefill.name || undefined,
+        email: prefill.email || undefined,
+        customAnswers: prefill.summary ? { a1: prefill.summary } : undefined,
+      },
+    });
+  } else {
+    window.open(url, "_blank", "noopener");
+  }
+}
 
 interface PersonaConfig {
   id: PersonaId;
@@ -561,6 +648,14 @@ export default function KIReadinessCheck() {
   const [answers, setAnswers] = useState<Record<string, number>>({});
   const [animating, setAnimating] = useState(false);
 
+  // Lead-Gate
+  const [leadEmail, setLeadEmail] = useState("");
+  const [leadName, setLeadName] = useState("");
+  const [leadCompany, setLeadCompany] = useState("");
+  const [leadConsent, setLeadConsent] = useState(false);
+  const [leadSubmitting, setLeadSubmitting] = useState(false);
+  const [leadError, setLeadError] = useState<string | null>(null);
+
   const totalAnswered = Object.keys(answers).length;
   const progress = (totalAnswered / TOTAL_QUESTIONS) * 100;
 
@@ -583,13 +678,20 @@ export default function KIReadinessCheck() {
         setCurrentDim(currentDim + 1);
         setCurrentQ(0);
       } else {
-        setPhase("result");
+        setPhase("gate");
       }
       setAnimating(false);
     }, 400);
   }
 
   function goBack() {
+    if (phase === "gate") {
+      const lastDim = DIMENSIONS.length - 1;
+      setCurrentDim(lastDim);
+      setCurrentQ(DIMENSIONS[lastDim].questions.length - 1);
+      setPhase("quiz");
+      return;
+    }
     if (phase === "quiz") {
       if (currentQ > 0) {
         setCurrentQ(currentQ - 1);
@@ -614,6 +716,119 @@ export default function KIReadinessCheck() {
   const sortedDims = useMemo(() =>
     [...DIMENSIONS].sort((a, b) => (dimScores[a.id] || 0) - (dimScores[b.id] || 0)),
   [dimScores]);
+
+  const percent = Math.round((weightedTotal / 4) * 100);
+
+  // ── Funnel-Tracking bei Phasenwechsel ──
+  useEffect(() => {
+    if (phase === "gate") {
+      track("quiz_completed", {
+        persona,
+        score: Number(weightedTotal.toFixed(2)),
+        level: assessment.level,
+      });
+    } else if (phase === "result") {
+      track("report_viewed", { persona, level: assessment.level });
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [phase]);
+
+  // ── Lead absenden (Gate) ──
+  async function submitLead(e: React.FormEvent) {
+    e.preventDefault();
+    if (leadSubmitting) return;
+    const email = leadEmail.trim();
+    if (!EMAIL_RX.test(email)) {
+      setLeadError("Bitte geben Sie eine gültige E-Mail-Adresse ein.");
+      return;
+    }
+    if (!leadConsent) {
+      setLeadError("Bitte stimmen Sie der Zusendung zu, um fortzufahren.");
+      return;
+    }
+    setLeadError(null);
+    setLeadSubmitting(true);
+    track("lead_submitted", { persona });
+
+    const payload: LeadPayload = {
+      email,
+      name: leadName.trim() || undefined,
+      company: leadCompany.trim() || undefined,
+      consent: leadConsent,
+      persona: (persona || "kmu") as LeadPayload["persona"],
+      result: {
+        total: Number(weightedTotal.toFixed(2)),
+        level: assessment.level,
+        levelTitle: assessment.title,
+        percent,
+        dimensions: DIMENSIONS.map((d) => ({
+          id: d.id,
+          label: d.shortLabel,
+          score: Number((dimScores[d.id] || 0).toFixed(2)),
+          weight: d.weight,
+        })),
+        killerTriggered: assessment.killerTriggered ?? null,
+      },
+      source: "ki-readiness-check",
+      meta:
+        typeof window !== "undefined"
+          ? {
+              url: window.location.href,
+              referrer: document.referrer || undefined,
+              utm: readUtm(),
+            }
+          : undefined,
+    };
+
+    try {
+      const resp = await fetch("/api/lead", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify(payload),
+      });
+      if (resp.ok) track("lead_captured", { persona, level: assessment.level });
+      else track("lead_error", { status: resp.status });
+    } catch {
+      track("lead_error", { status: 0 });
+    } finally {
+      // Der Nutzer sieht sein Ergebnis in jedem Fall (auch bei API-Störung).
+      setLeadSubmitting(false);
+      setPhase("result");
+    }
+  }
+
+  // ── CTA: Beratungstermin buchen (Calendly) ──
+  function handleBookingCTA() {
+    const isSoloPersona = persona === "solo";
+    const url = isSoloPersona
+      ? CALENDLY_SOLO || CALENDLY_BUSINESS
+      : CALENDLY_BUSINESS || CALENDLY_SOLO;
+    track("cta_clicked", { persona, level: assessment.level });
+    track("calendly_opened", { persona });
+    const personaLabel = PERSONAS.find((p) => p.id === persona)?.label || "";
+    openCalendly(url, {
+      name: leadName.trim(),
+      email: leadEmail.trim(),
+      summary: `KI-Readiness ${weightedTotal.toFixed(1)}/4 · ${assessment.title}${
+        personaLabel ? ` · ${personaLabel}` : ""
+      }`,
+    });
+  }
+
+  // ── Check neu starten ──
+  function restart() {
+    track("check_restarted");
+    setAnswers({});
+    setCurrentDim(0);
+    setCurrentQ(0);
+    setPersona(null);
+    setLeadEmail("");
+    setLeadName("");
+    setLeadCompany("");
+    setLeadConsent(false);
+    setLeadError(null);
+    setPhase("intro");
+  }
 
   // ── INTRO ──
   if (phase === "intro") {
@@ -641,7 +856,7 @@ export default function KIReadinessCheck() {
             ))}
           </div>
           <button
-            onClick={() => setPhase("persona")}
+            onClick={() => { track("check_started"); setPhase("persona"); }}
             style={{ background: "#E8720C", color: "#fff", border: "none", borderRadius: 8, padding: "16px 48px", fontSize: 16, fontWeight: 700, cursor: "pointer", transition: "transform 0.15s", letterSpacing: 0.3 }}
             onMouseEnter={(e) => (e.target as HTMLButtonElement).style.transform = "scale(1.04)"}
             onMouseLeave={(e) => (e.target as HTMLButtonElement).style.transform = "scale(1)"}
@@ -674,7 +889,7 @@ export default function KIReadinessCheck() {
             {PERSONAS.map((p) => (
               <button
                 key={p.id}
-                onClick={() => { setPersona(p.id); setPhase("quiz"); }}
+                onClick={() => { track("persona_selected", { persona: p.id }); setPersona(p.id); setPhase("quiz"); }}
                 style={{
                   display: "flex", alignItems: "center", gap: 16, padding: "20px 24px",
                   background: "rgba(255,255,255,0.06)", border: "2px solid rgba(255,255,255,0.15)",
@@ -787,12 +1002,134 @@ export default function KIReadinessCheck() {
     );
   }
 
+  // ── LEAD-GATE ──
+  if (phase === "gate") {
+    const showCompany = persona !== "solo";
+    return (
+      <div style={{ minHeight: "100vh", background: "linear-gradient(170deg, #0D1B2A 0%, #1A3A5C 50%, #2E6DA4 100%)", display: "flex", alignItems: "center", justifyContent: "center", padding: 20 }}>
+        <div style={{ maxWidth: 480, width: "100%" }}>
+          <div style={{ textAlign: "center", marginBottom: 24 }}>
+            <div style={{ display: "inline-flex", alignItems: "center", gap: 8, background: "rgba(39,174,96,0.15)", border: "1px solid rgba(39,174,96,0.4)", borderRadius: 20, padding: "6px 16px", marginBottom: 20 }}>
+              <span style={{ color: "#2ECC71", fontSize: 13, fontWeight: 700 }}>{"✓"}</span>
+              <span style={{ color: "#D6EAF8", fontSize: 12, fontWeight: 600 }}>Alle {TOTAL_QUESTIONS} Fragen beantwortet</span>
+            </div>
+            <h2 style={{ color: "#fff", fontSize: 26, fontWeight: 700, lineHeight: 1.25, margin: "0 0 10px" }}>
+              Ihr Ergebnis ist fertig.
+            </h2>
+            <p style={{ color: "#AED6F1", fontSize: 14, lineHeight: 1.6, margin: 0 }}>
+              Wohin dürfen wir Ihre persönliche Auswertung senden? Sie sehen Ihren Score und die
+              Handlungsempfehlungen direkt im Anschluss – die Zusammenfassung landet zusätzlich in Ihrem Postfach.
+            </p>
+          </div>
+
+          <form
+            onSubmit={submitLead}
+            style={{ background: "#fff", borderRadius: 12, boxShadow: "0 8px 40px rgba(0,0,0,0.25)", padding: "28px 26px" }}
+          >
+            <label style={{ display: "block", fontSize: 12, fontWeight: 700, color: "#1A3A5C", marginBottom: 6 }}>
+              E-Mail-Adresse *
+            </label>
+            <input
+              type="email"
+              required
+              autoComplete="email"
+              value={leadEmail}
+              onChange={(e) => setLeadEmail(e.target.value)}
+              placeholder="name@unternehmen.de"
+              style={{ width: "100%", padding: "13px 14px", borderRadius: 8, border: "1.5px solid #D5D8DC", fontSize: 14, fontFamily: "inherit", marginBottom: 14, outline: "none" }}
+              onFocus={(e) => (e.currentTarget.style.borderColor = "#2E6DA4")}
+              onBlur={(e) => (e.currentTarget.style.borderColor = "#D5D8DC")}
+            />
+
+            <label style={{ display: "block", fontSize: 12, fontWeight: 700, color: "#1A3A5C", marginBottom: 6 }}>
+              Name <span style={{ color: "#AAB", fontWeight: 400 }}>(optional)</span>
+            </label>
+            <input
+              type="text"
+              autoComplete="name"
+              value={leadName}
+              onChange={(e) => setLeadName(e.target.value)}
+              placeholder="Vor- und Nachname"
+              style={{ width: "100%", padding: "13px 14px", borderRadius: 8, border: "1.5px solid #D5D8DC", fontSize: 14, fontFamily: "inherit", marginBottom: 14, outline: "none" }}
+              onFocus={(e) => (e.currentTarget.style.borderColor = "#2E6DA4")}
+              onBlur={(e) => (e.currentTarget.style.borderColor = "#D5D8DC")}
+            />
+
+            {showCompany && (
+              <>
+                <label style={{ display: "block", fontSize: 12, fontWeight: 700, color: "#1A3A5C", marginBottom: 6 }}>
+                  Unternehmen <span style={{ color: "#AAB", fontWeight: 400 }}>(optional)</span>
+                </label>
+                <input
+                  type="text"
+                  autoComplete="organization"
+                  value={leadCompany}
+                  onChange={(e) => setLeadCompany(e.target.value)}
+                  placeholder="Firmenname"
+                  style={{ width: "100%", padding: "13px 14px", borderRadius: 8, border: "1.5px solid #D5D8DC", fontSize: 14, fontFamily: "inherit", marginBottom: 14, outline: "none" }}
+                  onFocus={(e) => (e.currentTarget.style.borderColor = "#2E6DA4")}
+                  onBlur={(e) => (e.currentTarget.style.borderColor = "#D5D8DC")}
+                />
+              </>
+            )}
+
+            <label style={{ display: "flex", alignItems: "flex-start", gap: 10, cursor: "pointer", marginBottom: 18, marginTop: 4 }}>
+              <input
+                type="checkbox"
+                checked={leadConsent}
+                onChange={(e) => setLeadConsent(e.target.checked)}
+                style={{ marginTop: 3, width: 16, height: 16, flexShrink: 0, cursor: "pointer", accentColor: "#2E6DA4" }}
+              />
+              <span style={{ fontSize: 11.5, color: "#666", lineHeight: 1.5 }}>
+                Ich möchte meine Auswertung erhalten und bin einverstanden, dass ZweiMeter.Consulting
+                mich zu meinem Ergebnis und passenden KI-Themen kontaktiert. Widerruf jederzeit möglich.{" "}
+                <a href={PRIVACY_URL} target="_blank" rel="noopener noreferrer" style={{ color: "#2E6DA4", textDecoration: "underline" }}>
+                  Datenschutz
+                </a>
+                .
+              </span>
+            </label>
+
+            {leadError && (
+              <div style={{ background: "#FDEDEC", border: "1px solid #F5B7B1", borderRadius: 8, padding: "10px 14px", fontSize: 12.5, color: "#922B21", marginBottom: 14 }}>
+                {leadError}
+              </div>
+            )}
+
+            <button
+              type="submit"
+              disabled={leadSubmitting}
+              style={{
+                width: "100%", background: leadSubmitting ? "#B0651F" : "#E8720C", color: "#fff", border: "none",
+                borderRadius: 8, padding: "15px", fontSize: 15, fontWeight: 700, cursor: leadSubmitting ? "wait" : "pointer",
+                letterSpacing: 0.3, transition: "background 0.15s",
+              }}
+            >
+              {leadSubmitting ? "Wird gesendet …" : "Ergebnis jetzt anzeigen →"}
+            </button>
+
+            <p style={{ textAlign: "center", color: "#AAB", fontSize: 10.5, marginTop: 12, marginBottom: 0 }}>
+              {"Kein Spam · Jederzeit abbestellbar · Daten werden vertraulich behandelt"}
+            </p>
+          </form>
+
+          <button
+            onClick={goBack}
+            style={{ display: "block", margin: "18px auto 0", background: "none", border: "none", color: "rgba(255,255,255,0.45)", fontSize: 13, cursor: "pointer" }}
+          >
+            {"← Zurück zur letzten Frage"}
+          </button>
+        </div>
+      </div>
+    );
+  }
+
   // ── RESULT ──
   const personaInfo = PERSONAS.find((p) => p.id === persona);
   const isSolo = persona === "solo";
 
   return (
-    <div style={{ minHeight: "100vh", background: "#F0F2F5" }}>
+    <div id="report-root" style={{ minHeight: "100vh", background: "#F0F2F5" }}>
       <div style={{ background: "#1A3A5C", padding: "20px 24px", textAlign: "center" }}>
         <div style={{ display: "inline-block", background: "#fff", borderRadius: 6, padding: "6px 12px", marginBottom: 10 }}>
           <img
@@ -804,10 +1141,37 @@ export default function KIReadinessCheck() {
         <h1 style={{ color: "#fff", fontSize: 22, fontWeight: 700, marginTop: 4 }}>Ihr KI-Readiness-Ergebnis</h1>
         <div style={{ color: "#AED6F1", fontSize: 12, marginTop: 4 }}>
           Perspektive: {personaInfo?.label}
+          {leadName.trim() ? ` · ${leadName.trim()}` : ""}
         </div>
       </div>
 
       <div style={{ maxWidth: 800, margin: "0 auto", padding: "32px 20px" }}>
+        {/* Aktionsleiste (nicht im PDF) */}
+        <div className="no-print" style={{ display: "flex", flexWrap: "wrap", gap: 10, justifyContent: "space-between", alignItems: "center", marginBottom: 24 }}>
+          <button
+            onClick={restart}
+            style={{ background: "none", border: "1px solid #C9D2DB", color: "#5A6B7B", borderRadius: 8, padding: "9px 16px", fontSize: 13, fontWeight: 600, cursor: "pointer" }}
+          >
+            {"↺ Check neu starten"}
+          </button>
+          <button
+            onClick={() => { track("pdf_exported", { persona, level: assessment.level }); window.print(); }}
+            style={{ background: "#fff", border: "1.5px solid #1A3A5C", color: "#1A3A5C", borderRadius: 8, padding: "9px 18px", fontSize: 13, fontWeight: 700, cursor: "pointer", display: "inline-flex", alignItems: "center", gap: 8 }}
+          >
+            <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+              <path d="M6 9V2h12v7" /><path d="M6 18H4a2 2 0 0 1-2-2v-5a2 2 0 0 1 2-2h16a2 2 0 0 1 2 2v5a2 2 0 0 1-2 2h-2" /><rect x="6" y="14" width="12" height="8" />
+            </svg>
+            Als PDF speichern
+          </button>
+        </div>
+
+        {/* Kopfzeile nur im PDF */}
+        <div className="print-only" style={{ marginBottom: 20, borderBottom: "2px solid #1A3A5C", paddingBottom: 10 }}>
+          <div style={{ fontSize: 11, color: "#888" }}>ZweiMeter.Consulting · KI-Readiness-Check</div>
+          <div style={{ fontSize: 11, color: "#888" }}>
+            Gesamtergebnis: {weightedTotal.toFixed(1)} / 4.0 ({assessment.title}) · Perspektive: {personaInfo?.label}
+          </div>
+        </div>
         {/* Gesamtergebnis */}
         <div style={{ background: "#fff", borderRadius: 12, boxShadow: "0 2px 20px rgba(0,0,0,0.06)", overflow: "hidden", marginBottom: 28 }}>
           <div style={{ background: assessment.color, padding: "28px 32px", textAlign: "center" }}>
@@ -911,7 +1275,7 @@ export default function KIReadinessCheck() {
         </div>
 
         {/* CTA */}
-        <div style={{ background: "linear-gradient(135deg, #1A3A5C, #2E6DA4)", borderRadius: 12, padding: "36px 32px", textAlign: "center" }}>
+        <div className="avoid-break" style={{ background: "linear-gradient(135deg, #1A3A5C, #2E6DA4)", borderRadius: 12, padding: "36px 32px", textAlign: "center" }}>
           <h3 style={{ color: "#fff", fontSize: 20, fontWeight: 700, marginBottom: 8 }}>
             {isSolo ? "Bereit, den nächsten Schritt zu gehen?" : "Bereit für den nächsten Schritt?"}
           </h3>
@@ -921,18 +1285,27 @@ export default function KIReadinessCheck() {
               : "Der persönliche KI-Readiness-Check geht tiefer: Zwei Beratungstage, eine vollständige Scorecard und ein konkreter Maßnahmenplan für Ihr Unternehmen."
             }
           </p>
-          <button style={{
-            background: "#E8720C", color: "#fff", border: "none", borderRadius: 8,
-            padding: "14px 40px", fontSize: 15, fontWeight: 700, cursor: "pointer",
-            letterSpacing: 0.3,
-          }}>
+          <button
+            className="no-print"
+            onClick={handleBookingCTA}
+            style={{
+              background: "#E8720C", color: "#fff", border: "none", borderRadius: 8,
+              padding: "14px 40px", fontSize: 15, fontWeight: 700, cursor: "pointer",
+              letterSpacing: 0.3, transition: "transform 0.15s",
+            }}
+            onMouseEnter={(e) => (e.currentTarget.style.transform = "scale(1.04)")}
+            onMouseLeave={(e) => (e.currentTarget.style.transform = "scale(1)")}
+          >
             {isSolo ? "Erstgespräch vereinbaren" : "Persönlichen Check anfragen"}
           </button>
-          <p style={{ color: "rgba(255,255,255,0.35)", fontSize: 11, marginTop: 16 }}>
+          <p className="no-print" style={{ color: "rgba(255,255,255,0.35)", fontSize: 11, marginTop: 16 }}>
             {isSolo
               ? "Unverbindlich · 30 Minuten · Kostenlos"
               : "BAFA-förderfähig · 3.500 – 4.500 € netto · Remote oder vor Ort"
             }
+          </p>
+          <p className="print-only" style={{ color: "#fff", fontSize: 12, marginTop: 8 }}>
+            Termin vereinbaren: {isSolo ? (CALENDLY_SOLO || CALENDLY_BUSINESS || "https://zweimeter.consulting") : (CALENDLY_BUSINESS || CALENDLY_SOLO || "https://zweimeter.consulting")}
           </p>
         </div>
 
