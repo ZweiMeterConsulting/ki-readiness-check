@@ -1,8 +1,12 @@
 import { NextResponse } from "next/server";
 import type { LeadPayload } from "@/lib/lead";
+import { renderReportHtml } from "@/lib/report-html";
+import { generateReportPdf } from "@/lib/pdf";
+import { sendBrevoEmail, type BrevoAttachment } from "@/lib/brevo-email";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
+export const maxDuration = 60;
 
 const EMAIL_RX = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 const BREVO_BASE = "https://api.brevo.com/v3";
@@ -17,6 +21,55 @@ async function safeText(r: Response): Promise<string> {
   } catch {
     return "";
   }
+}
+
+function esc(s: unknown): string {
+  return String(s ?? "")
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;");
+}
+
+// Begleitmail an den Kunden (PDF liegt als Anhang bei).
+function customerEmailHtml(firstName: string, scoreLine: string): string {
+  const hi = firstName ? `Hallo ${esc(firstName)},` : "Hallo,";
+  return `<div style="font-family:-apple-system,Segoe UI,Roboto,Arial,sans-serif;color:#2C3E50;font-size:14px;line-height:1.6">
+    <p>${hi}</p>
+    <p>vielen Dank für Ihren KI-Readiness-Check. Ihr persönliches Ergebnis${
+      scoreLine ? ` (<strong>${esc(scoreLine)}</strong>)` : ""
+    } finden Sie als PDF im Anhang dieser E-Mail.</p>
+    <p>Der Report ordnet Ihre Selbsteinschätzung über sechs Dimensionen ein und zeigt, wo die größten Hebel liegen.
+    Wenn Sie die Ergebnisse gemeinsam besprechen und konkrete nächste Schritte ableiten möchten, melden Sie sich gern.</p>
+    <p>Herzliche Grüße<br/>Robert-Alexander Sonnenberger<br/>ZweiMeter.Consulting</p>
+  </div>`;
+}
+
+// Interne Benachrichtigung an dich (mit Lead-Daten + PDF im Anhang).
+function internalEmailHtml(body: LeadPayload, scoreLine: string): string {
+  const r = body.result;
+  const rows: [string, string][] = [
+    ["E-Mail", body.email],
+    ["Name", body.name || "—"],
+    ["Unternehmen", body.company || "—"],
+    ["Perspektive", body.persona],
+    ["Gesamt", scoreLine || "—"],
+    ["Prozent", r ? `${r.percent}%` : "—"],
+    ["Killer", r?.killerTriggered || "—"],
+    ["Quelle", body.source || "ki-readiness-check"],
+  ];
+  const table = rows
+    .map(
+      ([k, v]) =>
+        `<tr><td style="padding:3px 12px 3px 0;color:#5A6B7B">${esc(k)}</td><td style="padding:3px 0"><strong>${esc(
+          v
+        )}</strong></td></tr>`
+    )
+    .join("");
+  return `<div style="font-family:-apple-system,Segoe UI,Roboto,Arial,sans-serif;color:#2C3E50;font-size:14px;line-height:1.6">
+    <p>Neuer KI-Readiness-Lead:</p>
+    <table style="border-collapse:collapse;font-size:13px">${table}</table>
+    <p style="color:#5A6B7B;font-size:12px">Das vollständige Ergebnis liegt als PDF bei. Kontakt-Attribute wurden in Brevo aktualisiert.</p>
+  </div>`;
 }
 
 export async function POST(req: Request) {
@@ -47,7 +100,7 @@ export async function POST(req: Request) {
   const attributes: Record<string, unknown> = {
     VORNAME: firstName || undefined,
     NACHNAME: lastName || undefined,
-    FIRMA: body.company?.trim() || undefined,
+    UNTERNEHMEN: body.company?.trim() || undefined,
     KI_PERSONA: body.persona,
     KI_SCORE: r ? Number(r.total.toFixed(2)) : undefined,
     KI_PROZENT: r?.percent,
@@ -122,7 +175,59 @@ export async function POST(req: Request) {
     results.brevo = "skipped_no_key";
   }
 
-  // ── 2) CRM-Weiterleitung (optional – „später ins CRM") ──────────────────
+  // ── 2) PDF erzeugen + per E-Mail an Kunde und intern versenden ──────────
+  // Läuft nur, wenn ein Brevo-Key da ist (Versand über Brevo Transactional).
+  // Alles in try/catch: ein PDF-/Mail-Fehler darf den Lead nie kippen.
+  if (brevoKey) {
+    const senderEmail = process.env.BREVO_SENDER_EMAIL || "robert@zweimeter.online";
+    const senderName = process.env.BREVO_SENDER_NAME || "ZweiMeter.Consulting";
+    const notifyEmail = process.env.LEAD_NOTIFY_EMAIL; // interne Kopie an dich
+    try {
+      const html = renderReportHtml(body, { generatedAt: new Date().toISOString() });
+      const pdf = await generateReportPdf(html);
+      const attachment: BrevoAttachment = {
+        name: "KI-Readiness-Report.pdf",
+        content: pdf.toString("base64"),
+      };
+      const scoreLine = r ? `${r.total.toFixed(1)}/4 · ${r.levelTitle}` : "";
+
+      // a) an den Kunden
+      const customer = await sendBrevoEmail({
+        apiKey: brevoKey,
+        senderName,
+        senderEmail,
+        replyToEmail: senderEmail,
+        to: [{ email, name: (body.name || "").trim() || undefined }],
+        subject: "Ihr KI-Readiness-Report",
+        htmlContent: customerEmailHtml(firstName, scoreLine),
+        attachments: [attachment],
+      });
+      results.mail_customer = customer.ok ? "sent" : `error_${customer.status}`;
+      if (!customer.ok) console.error("Brevo mail (customer)", customer.status, customer.body);
+
+      // b) interne Kopie an dich
+      if (notifyEmail) {
+        const internal = await sendBrevoEmail({
+          apiKey: brevoKey,
+          senderName,
+          senderEmail,
+          to: [{ email: notifyEmail }],
+          subject: `Neuer KI-Readiness-Lead: ${email} (${scoreLine})`,
+          htmlContent: internalEmailHtml(body, scoreLine),
+          attachments: [attachment],
+        });
+        results.mail_internal = internal.ok ? "sent" : `error_${internal.status}`;
+        if (!internal.ok) console.error("Brevo mail (internal)", internal.status, internal.body);
+      } else {
+        results.mail_internal = "skipped_no_notify_email";
+      }
+    } catch (e) {
+      console.error("PDF/Mail failed", e);
+      results.pdf_mail = "exception";
+    }
+  }
+
+  // ── 3) CRM-Weiterleitung (optional – „später ins CRM") ──────────────────
   // Sobald CRM_WEBHOOK_URL gesetzt ist, wird der Lead zusätzlich dorthin
   // geschickt. Das Payload ist bereits am Contact-Modell des CRM ausgerichtet.
   const crmUrl = process.env.CRM_WEBHOOK_URL;

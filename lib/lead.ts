@@ -18,6 +18,9 @@ export interface LeadResult {
   percent: number; // 0..100
   dimensions: LeadDimensionScore[];
   killerTriggered?: string | null;
+  // Fließtexte aus der Auswertung – für das PDF (im Frontend bereits berechnet).
+  assessmentText?: string;
+  recommendation?: string;
 }
 
 export interface LeadPayload {

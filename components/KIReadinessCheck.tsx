@@ -655,6 +655,7 @@ export default function KIReadinessCheck() {
   const [leadConsent, setLeadConsent] = useState(false);
   const [leadSubmitting, setLeadSubmitting] = useState(false);
   const [leadError, setLeadError] = useState<string | null>(null);
+  const [pdfBusy, setPdfBusy] = useState(false);
 
   const totalAnswered = Object.keys(answers).length;
   const progress = (totalAnswered / TOTAL_QUESTIONS) * 100;
@@ -768,6 +769,8 @@ export default function KIReadinessCheck() {
           weight: d.weight,
         })),
         killerTriggered: assessment.killerTriggered ?? null,
+        assessmentText: assessment.text,
+        recommendation: assessment.recommendation,
       },
       source: "ki-readiness-check",
       meta:
@@ -813,6 +816,59 @@ export default function KIReadinessCheck() {
         personaLabel ? ` · ${personaLabel}` : ""
       }`,
     });
+  }
+
+  // ── PDF herunterladen (serverseitig via /api/report) ──
+  async function handleDownloadPdf() {
+    if (pdfBusy) return;
+    track("pdf_exported", { persona, level: assessment.level });
+    const payload: LeadPayload = {
+      email: leadEmail.trim() || "download@local",
+      name: leadName.trim() || undefined,
+      company: leadCompany.trim() || undefined,
+      consent: true,
+      persona: (persona || "kmu") as LeadPayload["persona"],
+      result: {
+        total: Number(weightedTotal.toFixed(2)),
+        level: assessment.level,
+        levelTitle: assessment.title,
+        percent,
+        dimensions: DIMENSIONS.map((d) => ({
+          id: d.id,
+          label: d.shortLabel,
+          score: Number((dimScores[d.id] || 0).toFixed(2)),
+          weight: d.weight,
+        })),
+        killerTriggered: assessment.killerTriggered ?? null,
+        assessmentText: assessment.text,
+        recommendation: assessment.recommendation,
+      },
+      source: "ki-readiness-check",
+    };
+    setPdfBusy(true);
+    try {
+      const resp = await fetch("/api/report", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify(payload),
+      });
+      if (!resp.ok) throw new Error("PDF-Server " + resp.status);
+      const blob = await resp.blob();
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = "KI-Readiness-Report.pdf";
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      URL.revokeObjectURL(url);
+    } catch (e) {
+      // Fallback: Browser-Druckdialog, falls der Server-PDF-Weg scheitert.
+      console.error("PDF-Download fehlgeschlagen, nutze Druckdialog", e);
+      window.print();
+    } finally {
+      setPdfBusy(false);
+    }
   }
 
   // ── Check neu starten ──
@@ -1155,13 +1211,14 @@ export default function KIReadinessCheck() {
             {"↺ Check neu starten"}
           </button>
           <button
-            onClick={() => { track("pdf_exported", { persona, level: assessment.level }); window.print(); }}
-            style={{ background: "#fff", border: "1.5px solid #1A3A5C", color: "#1A3A5C", borderRadius: 8, padding: "9px 18px", fontSize: 13, fontWeight: 700, cursor: "pointer", display: "inline-flex", alignItems: "center", gap: 8 }}
+            onClick={handleDownloadPdf}
+            disabled={pdfBusy}
+            style={{ background: "#fff", border: "1.5px solid #1A3A5C", color: "#1A3A5C", borderRadius: 8, padding: "9px 18px", fontSize: 13, fontWeight: 700, cursor: pdfBusy ? "wait" : "pointer", display: "inline-flex", alignItems: "center", gap: 8, opacity: pdfBusy ? 0.7 : 1 }}
           >
             <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
               <path d="M6 9V2h12v7" /><path d="M6 18H4a2 2 0 0 1-2-2v-5a2 2 0 0 1 2-2h16a2 2 0 0 1 2 2v5a2 2 0 0 1-2 2h-2" /><rect x="6" y="14" width="12" height="8" />
             </svg>
-            Als PDF speichern
+            {pdfBusy ? "PDF wird erstellt …" : "Als PDF speichern"}
           </button>
         </div>
 
