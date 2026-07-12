@@ -36,10 +36,21 @@ export async function generateReportPdf(html: string): Promise<Buffer> {
   const isVercel = !!process.env.VERCEL;
 
   // In Docker ist /dev/shm oft zu klein → --disable-dev-shm-usage, sonst
-  // stürzt Chromium beim Rendern ab.
+  // stürzt Chromium beim Rendern ab. --disable-crash-reporter/--disable-breakpad
+  // verhindern den chrome_crashpad_handler, der im Container ohne beschreibbares
+  // HOME mit "--database is required" abbricht. --user-data-dir zeigt auf /tmp
+  // (garantiert beschreibbar für den non-root Nutzer).
   const launchArgs = isVercel
     ? chromium.args
-    : ["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage", "--disable-gpu"];
+    : [
+        "--no-sandbox",
+        "--disable-setuid-sandbox",
+        "--disable-dev-shm-usage",
+        "--disable-gpu",
+        "--disable-crash-reporter",
+        "--disable-breakpad",
+        "--user-data-dir=/tmp/chromium-user-data",
+      ];
 
   let browser: Browser | null = null;
   try {

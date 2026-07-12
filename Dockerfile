@@ -63,6 +63,9 @@ ENV NODE_ENV=production
 ENV NEXT_TELEMETRY_DISABLED=1
 ENV PORT=3000
 ENV HOSTNAME=0.0.0.0
+# Beschreibbares HOME für den non-root Nutzer – sonst kann Chromium seine
+# Crashpad-/Config-Dateien nicht anlegen und startet nicht.
+ENV HOME=/tmp
 
 # Chromium + Fonts + Zertifikate. Das chromium-Paket zieht seine
 # gemeinsamen Bibliotheken (libnss3, libgbm1, …) automatisch mit.
