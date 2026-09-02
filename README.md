@@ -10,50 +10,7 @@ Interaktives Web-Assessment-Tool zur Bestimmung der KI-Bereitschaft von Unterneh
 - **Killer-Dimensionen-Logik:** Strategie und Prozesse als K.O.-Kriterien
 - **Radar-Chart** (SVG) mit 6 Achsen
 - **Persona-abhängige Reports** mit differenzierten Handlungsempfehlungen
-- **E-Mail-Gate:** Pflicht-Lead-Erfassung vor dem Ergebnis (max. Lead-Quote)
-- **Brevo-Anbindung:** Leads landen inkl. Scores in einer Liste → Follow-up-Automation
-- **PDF-Export:** branded A4-Report per „Als PDF speichern" (Browser-Druck)
-- **Calendly-CTA:** persona-abhängige Terminbuchung, mit vorausgefüllten Daten
-- **Funnel-Tracking:** Plausible/GA4-Events über den gesamten Funnel
 - **Funnel-Steuerung:** Solo → zweimeter.online, KMU/Bereich → ZweiMeter.Consulting
-
-## Lead-Flow & Monetarisierung
-
-Der Check ist als **Leuchtturmprodukt** aufgebaut: kostenlos, hoher Wahrnehmungswert,
-und er füllt die Pipeline für die Beratung.
-
-```
-Intro → Persona → 24 Fragen → E-Mail-Gate (Lead → Brevo) → Report → CTA (Calendly)
-```
-
-- **Leads** werden serverseitig über `/api/lead` in **Brevo** angelegt (inkl. aller
-  Dimensions-Scores als Kontakt-Attribute). Die Ziel-Liste triggert deine Follow-up-Sequenz.
-- **Umsatz** entsteht über gebuchte **Calendly**-Termine (Erstgespräch → bezahlter Check).
-- **Später ins CRM:** Sobald `CRM_WEBHOOK_URL` gesetzt ist, wird jeder Lead zusätzlich
-  als JSON an das CRM (`D:\dev\crm-clean`) geschickt – am `Contact`-Modell ausgerichtet.
-
-### Konfiguration
-
-Alle Zugänge laufen über Umgebungsvariablen. Kopiere `.env.example` → `.env.local`
-und trage deine Werte ein (Details siehe Kommentare in der Datei):
-
-| Variable | Zweck |
-|----------|-------|
-| `BREVO_API_KEY` | Brevo v3 API-Key (Lead-Upsert) |
-| `BREVO_LIST_ID` | Ziel-Liste für Leads (triggert Follow-up) |
-| `BREVO_DOI_TEMPLATE_ID` / `BREVO_DOI_REDIRECT_URL` | optional: Double-Opt-In |
-| `NEXT_PUBLIC_CALENDLY_URL_SOLO` / `_BUSINESS` | Terminlinks je Persona |
-| `NEXT_PUBLIC_PRIVACY_URL` | Datenschutz-Link im Gate |
-| `NEXT_PUBLIC_PLAUSIBLE_DOMAIN` / `NEXT_PUBLIC_GA_ID` | optionales Tracking |
-| `CRM_WEBHOOK_URL` / `CRM_WEBHOOK_SECRET` | optional: CRM-Weiterleitung (später) |
-
-**Ohne Keys** läuft die App vollständig (Gate akzeptiert die Eingabe, Report erscheint) –
-der Lead wird nur nicht verschickt (Server-Log: `skipped_no_key`). Ideal für lokale Tests.
-
-**Brevo-Attribute** vorab anlegen (Kontakte → Einstellungen → Attribute): `VORNAME`,
-`NACHNAME`, `FIRMA` (Text), `KI_PERSONA`, `KI_LEVEL_TITEL`, `KI_KILLER`, `KI_QUELLE` (Text),
-sowie `KI_SCORE`, `KI_PROZENT`, `KI_LEVEL`, `KI_STRATEGIE`, `KI_PROZESSE`, `KI_DATEN`,
-`KI_TECHNIK`, `KI_MENSCHEN`, `KI_REGULATORIK` (Zahl).
 
 ## Tech Stack
 
@@ -111,8 +68,13 @@ ki-readiness-check/
 ├── app/
 │   ├── layout.tsx          # Root-Layout mit DM Sans Font & Metadaten
 │   └── page.tsx            # Hauptseite (rendert KIReadinessCheck)
+│   └── api/report/route.ts # PDF-Erzeugung + E-Mail-Versand (Resend)
 ├── components/
-│   └── KIReadinessCheck.tsx  # Komplette App-Logik (854 Zeilen)
+│   └── KIReadinessCheck.tsx  # UI: Intro, Persona, Quiz, E-Mail-Gate, Ergebnis
+├── lib/
+│   ├── scoring.ts          # Fragen, Dimensionen, Gewichtung, Berechnung (Client + Server)
+│   └── pdf/ReportDocument.tsx  # PDF-Vorlage (@react-pdf/renderer)
+├── .env.example            # Vorlage für Umgebungsvariablen
 ├── public/                 # Statische Assets (leer, für Logo etc.)
 ├── package.json
 ├── tsconfig.json
@@ -138,16 +100,47 @@ Gesamtscore     = (D1×1.5 + D2×1.3 + D3×1.0 + D4×1.0 + D5×1.0 + D6×0.8) / 
 | Menschen    | 1.0     | Nein |
 | Regulatorik | 0.8     | Nein |
 
-## Nächste Schritte (nach Launch)
+## E-Mail-Gate, PDF-Report und Lead-Benachrichtigung (seit v1.1)
+
+Ablauf: Intro → Persona → 24 Fragen → **E-Mail-Gate** (Name, Firma, E-Mail, Datenschutz) → Ergebnis.
+Beim Absenden des Gates ruft die Komponente `POST /api/report` auf. Die Route
+
+1. validiert Antworten und Kontaktdaten (Honeypot-Feld `website` gegen Bots),
+2. berechnet das Ergebnis serverseitig neu (`lib/scoring.ts`, gleiche Logik wie im Frontend),
+3. erzeugt das PDF mit `@react-pdf/renderer` (`lib/pdf/ReportDocument.tsx`, ohne Browser-Engine),
+4. verschickt über **Resend** zwei Mails: an den Kunden (Ergebnis + PDF) und an `LEAD_NOTIFY_EMAIL` (Lead mit allen 24 Antworten, JSON-Rohdaten + PDF).
+
+Schlägt der Versand fehl, sieht der Kunde sein Ergebnis trotzdem, mit Hinweis und Kontaktadresse.
+
+### Einrichtung
+
+1. Konto bei [resend.com](https://resend.com) anlegen, Domain (z. B. `zweimeter.consulting`) verifizieren (SPF/DKIM-DNS-Einträge), API-Key erzeugen.
+2. `.env.example` nach `.env.local` kopieren und Werte eintragen. Dieselben Variablen in Vercel unter *Settings → Environment Variables* setzen.
+3. `npm install` (neue Abhängigkeiten: `resend`, `@react-pdf/renderer`).
+4. Test lokal: `REPORT_PREVIEW=1 npm run dev`, dann `http://localhost:3000/api/report?preview=1&persona=kmu` öffnen → Demo-PDF ohne Versand (`&value=1` erzwingt „Nicht bereit“).
+
+### Umgebungsvariablen
+
+| Variable | Pflicht | Bedeutung |
+|---|---|---|
+| `RESEND_API_KEY` | ja | API-Key von Resend |
+| `MAIL_FROM` | ja | Absender, Domain muss bei Resend verifiziert sein |
+| `LEAD_NOTIFY_EMAIL` | ja | Empfänger der internen Lead-Mail |
+| `MAIL_REPLY_TO` | nein | Antwortadresse in der Kunden-Mail |
+| `NEXT_PUBLIC_CALENDLY_URL` | nein | Calendly-Link für das Erstgespräch (Ergebnis bei „Nicht bereit“, PDF, Kunden-Mail) |
+| `NEXT_PUBLIC_PRIVACY_URL` | nein | Link zur Datenschutzerklärung im Gate |
+| `NEXT_PUBLIC_CTA_URL_SOLO` / `NEXT_PUBLIC_CTA_URL_BUSINESS` | nein | Ziel der CTA-Buttons im Ergebnis |
+| `NEXT_PUBLIC_CONTACT_EMAIL` | nein | Kontaktadresse im Fehlerhinweis |
+| `REPORT_PREVIEW` | nein | `1` = Demo-PDF unter `/api/report?preview=1` (nur Entwicklung) |
+
+## Nächste Schritte
 
 - [x] E-Mail-Gate vor Report (Lead-Erfassung)
-- [x] PDF-Export des Ergebnisses
-- [x] Calendly-Integration im CTA
-- [x] Analytics/Tracking (Funnel-Events)
-- [x] Brevo-Anbindung für Follow-up-Sequenzen
-- [ ] CRM-Weiterleitung aktivieren (`CRM_WEBHOOK_URL` setzen, sobald CRM live)
-- [ ] Brevo-Follow-up-Automation gestalten (Willkommensmail + Nurture-Strecke)
-- [ ] A/B-Test Gate-Wording / Conversion-Optimierung
+- [x] PDF-Export des Ergebnisses (per E-Mail)
+- [ ] Lead per Webhook an das CRM übergeben (`LEAD_WEBHOOK_URL`)
+- [x] Calendly-Integration (Erstgespräch bei „Nicht bereit“, Solo-CTA, PDF, Mail)
+- [ ] Analytics/Tracking (Funnel-Events)
+- [ ] Brevo-Anbindung für Follow-up-Sequenzen
 
 ---
 
