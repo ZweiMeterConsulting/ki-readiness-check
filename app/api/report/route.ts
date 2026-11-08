@@ -3,6 +3,8 @@
 // erzeugt das PDF und verschickt zwei E-Mails über Resend:
 //   1. an den Kunden (Ergebnis + PDF im Anhang)
 //   2. an LEAD_NOTIFY_EMAIL (Lead-Benachrichtigung mit allen Antworten + PDF)
+// Zusätzlich wird der Lead als Kontakt mit KI_*-Attributen nach Brevo
+// synchronisiert (Marketing-Sales-Bridge, siehe lib/brevo-contacts.ts).
 //
 // GET /api/report?preview=1 liefert ein Demo-PDF (nur wenn REPORT_PREVIEW=1 gesetzt ist).
 
@@ -17,6 +19,7 @@ import { computeResult, validateAnswers, DIMENSIONS, PERSONAS, SCALE_OPTIONS, CA
 import type { PersonaId, ReportResult } from "@/lib/scoring";
 import { ReportDocument } from "@/lib/pdf/ReportDocument";
 import type { ReportContact } from "@/lib/pdf/ReportDocument";
+import { syncLeadToBrevo } from "@/lib/brevo-contacts";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -174,7 +177,7 @@ export async function POST(req: Request) {
   const resend = new Resend(RESEND_API_KEY);
   const attachments = [{ filename, content: pdf }];
 
-  const [toCustomer, toOwner] = await Promise.allSettled([
+  const [toCustomer, toOwner, brevoSync] = await Promise.allSettled([
     resend.emails.send({
       from: MAIL_FROM,
       to: email,
@@ -191,7 +194,15 @@ export async function POST(req: Request) {
       html: leadHtml(result, contact, meta),
       attachments,
     }),
+    // Kontakt + KI_*-Attribute nach Brevo (Marketing-Sales-Bridge). Fehler
+    // werden nur geloggt – der Report-Versand darf daran nie scheitern.
+    syncLeadToBrevo(contact, result),
   ]);
+
+  const brevoStatus = brevoSync.status === "fulfilled" ? brevoSync.value : "exception";
+  if (brevoStatus !== "upserted" && brevoStatus !== "skipped_no_key") {
+    console.error("[report] Brevo-Kontaktsync fehlgeschlagen:", brevoStatus);
+  }
 
   const customerOk = toCustomer.status === "fulfilled" && !toCustomer.value.error;
   const ownerOk = toOwner.status === "fulfilled" && !toOwner.value.error;
@@ -201,7 +212,7 @@ export async function POST(req: Request) {
   if (!customerOk) {
     return NextResponse.json({ ok: false, error: "Die E-Mail konnte nicht zugestellt werden. Bitte prüfen Sie die Adresse." }, { status: 502 });
   }
-  return NextResponse.json({ ok: true, leadNotified: ownerOk });
+  return NextResponse.json({ ok: true, leadNotified: ownerOk, brevo: brevoStatus });
 }
 
 // ── GET (Vorschau) ─────────────────────────────────────
